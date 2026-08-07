@@ -29,3 +29,24 @@ add_executable(test_matching
 target_link_libraries(test_matching PRIVATE order_book)
 
 add_test(NAME MatchingTests COMMAND test_matching)
+
+add_executable(test_market_orders
+    tests/test_market_orders.cpp
+)
+target_link_libraries(test_market_orders PRIVATE order_book)
+
+add_test(NAME MarketOrderTests COMMAND test_market_orders)
+
+add_executable(test_modify_order
+    tests/test_modify_order.cpp
+)
+target_link_libraries(test_modify_order PRIVATE order_book)
+
+add_test(NAME ModifyOrderTests COMMAND test_modify_order)
+
+# --- Benchmark executable ---
+add_executable(bench_order_book
+    benchmarks/bench_order_book.cpp
+)
+target_link_libraries(bench_order_book PRIVATE order_book)
+
