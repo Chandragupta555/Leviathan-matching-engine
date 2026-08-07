@@ -90,6 +90,19 @@ public:
 
     size_t              totalOrderCount() const;
 
+    // EXCEPTION: added for replay_tool's market-depth display.  The existing
+    // public API (bestBid/bestAsk/totalOrderCount) only exposes the top price
+    // level and total count — there is no combination of existing methods that
+    // can enumerate non-top price levels or report aggregate quantity at each
+    // level.  This const, read-only method returns aggregated depth without
+    // exposing internal implementation details (maps, deques, etc.).
+    struct PriceLevel {
+        double   price;
+        uint64_t aggregate_quantity;
+        size_t   order_count;
+    };
+    std::vector<PriceLevel> getDepth(Order::Side side, size_t max_levels) const;
+
 private:
     // Price-level maps (the comparator controls sort direction).
     using BidMap = std::map<double, std::deque<Order>, std::greater<double>>;

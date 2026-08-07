@@ -87,6 +87,41 @@ size_t OrderBook::totalOrderCount() const {
 }
 
 // ---------------------------------------------------------------------------
+// getDepth — EXCEPTION addition (see order_book.hpp comment for justification).
+// Returns up to max_levels aggregated price levels for the requested side.
+// O(L * max_levels) where L = orders per level (to sum quantities).
+// ---------------------------------------------------------------------------
+template <typename MapType>
+static std::vector<OrderBook::PriceLevel> depthFromMap(const MapType& side_map,
+                                                        size_t max_levels)
+{
+    std::vector<OrderBook::PriceLevel> depth;
+    depth.reserve(max_levels);
+
+    size_t count = 0;
+    for (auto it = side_map.begin(); it != side_map.end() && count < max_levels;
+         ++it, ++count)
+    {
+        uint64_t agg_qty = 0;
+        for (const auto& order : it->second) {
+            agg_qty += order.quantity;
+        }
+        depth.push_back({it->first, agg_qty, it->second.size()});
+    }
+    return depth;
+}
+
+std::vector<OrderBook::PriceLevel> OrderBook::getDepth(Order::Side side,
+                                                        size_t max_levels) const
+{
+    if (side == Order::Side::BUY) {
+        return depthFromMap(bids_, max_levels);
+    } else {
+        return depthFromMap(asks_, max_levels);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // removeFrontOrder_  (private helper)
 //
 // Pops the front order from a price-level deque and removes it from

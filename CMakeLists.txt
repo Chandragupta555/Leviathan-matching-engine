@@ -50,3 +50,23 @@ add_executable(bench_order_book
 )
 target_link_libraries(bench_order_book PRIVATE order_book)
 
+# --- Recording / Replay library (static) ---
+add_library(recording_replay STATIC
+    src/recording_order_book.cpp
+    src/replay.cpp
+)
+target_link_libraries(recording_replay PUBLIC order_book)
+
+# --- Replay tool executable ---
+add_executable(replay_tool
+    tools/replay_tool.cpp
+)
+target_link_libraries(replay_tool PRIVATE recording_replay)
+
+# --- Replay tests ---
+add_executable(test_replay
+    tests/test_replay.cpp
+)
+target_link_libraries(test_replay PRIVATE recording_replay)
+
+add_test(NAME ReplayTests COMMAND test_replay)
