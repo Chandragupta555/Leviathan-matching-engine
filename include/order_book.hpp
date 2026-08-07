@@ -75,7 +75,15 @@ public:
 
     // Submit an incoming order for matching, then rest any unfilled remainder.
     // Returns a vector of Trade records produced (empty if no crossing).
+    // Handles both LIMIT and MARKET orders — MARKET orders never rest.
     std::vector<Trade>  submitOrder(Order order);
+
+    // Modify an existing resting order's price and/or quantity.
+    // Returns std::nullopt if order_id doesn't exist.
+    // Returns a (possibly empty) vector of Trade if modification succeeded.
+    std::optional<std::vector<Trade>> modifyOrder(uint64_t order_id,
+                                                   double new_price,
+                                                   uint64_t new_quantity);
 
     std::optional<double> bestBid() const;
     std::optional<double> bestAsk() const;

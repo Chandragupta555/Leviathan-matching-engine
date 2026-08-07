@@ -116,10 +116,23 @@ void OrderBook::removeFrontOrder_(MapType& side_map,
 // Entry point for incoming orders.  Attempts to match against the opposite
 // side of the book, then rests any unfilled remainder via addOrder().
 //
+// Design: both LIMIT and MARKET orders share the same matching loop body.
+// The ONLY difference is the price-crossing check:
+//   - LIMIT BUY:  best ask <= incoming price   (price constraint)
+//   - LIMIT SELL: best bid >= incoming price   (price constraint)
+//   - MARKET:     always true — accepts whatever price is available
+// This avoids duplicating the fill logic for the two order types.
+//
+// CRITICAL: A MARKET order (OrderType::MARKET) must NEVER rest in the book.
+// If a MARKET order is not fully filled because the opposite side is
+// exhausted, the unfilled remainder is simply discarded — addOrder() is
+// NOT called for it.  This is enforced at the bottom of the function.
+//
 // Termination guarantee: the while-loop advances on every iteration because
 // each iteration either:
 //   (a) reduces incoming.quantity toward 0  (fill_qty >= 1), or
-//   (b) breaks out because no price level crosses anymore.
+//   (b) breaks out because no price level crosses anymore (LIMIT only),
+//       or the opposite side is empty.
 // Since incoming.quantity is finite and strictly decreases, the loop
 // terminates.
 //
@@ -133,14 +146,20 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
         return {};
     }
 
+    const bool is_market = (incoming.type == Order::OrderType::MARKET);
+
     std::vector<Trade> trades;
 
     if (incoming.side == Order::Side::BUY) {
-        // Match against ASK side: while the best ask <= incoming buy price.
+        // Match against ASK side.
+        // LIMIT: while best ask <= incoming price.
+        // MARKET: while asks exist (no price constraint).
         while (incoming.quantity > 0 && !asks_.empty()) {
             auto level_it = asks_.begin();          // best (lowest) ask
-            if (level_it->first > incoming.price) {
-                break;  // no more crossable price levels
+
+            // Price-crossing check — skipped entirely for MARKET orders.
+            if (!is_market && level_it->first > incoming.price) {
+                break;  // no more crossable price levels (LIMIT only)
             }
 
             auto& resting = level_it->second.front();  // earliest order at this level
@@ -166,11 +185,15 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
             }
         }
     } else {
-        // incoming is SELL — match against BID side: while best bid >= incoming sell price.
+        // incoming is SELL — match against BID side.
+        // LIMIT: while best bid >= incoming price.
+        // MARKET: while bids exist (no price constraint).
         while (incoming.quantity > 0 && !bids_.empty()) {
             auto level_it = bids_.begin();          // best (highest) bid
-            if (level_it->first < incoming.price) {
-                break;  // no more crossable price levels
+
+            // Price-crossing check — skipped entirely for MARKET orders.
+            if (!is_market && level_it->first < incoming.price) {
+                break;  // no more crossable price levels (LIMIT only)
             }
 
             auto& resting = level_it->second.front();
@@ -195,10 +218,119 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
         }
     }
 
-    // Rest any unfilled remainder via the existing addOrder() method.
-    if (incoming.quantity > 0) {
+    // Rest any unfilled remainder via the existing addOrder() method —
+    // but ONLY for LIMIT orders.
+    //
+    // CRITICAL: MARKET orders NEVER rest.  If a MARKET order has unfilled
+    // quantity here, it means the opposite side ran out of liquidity.
+    // The remainder is simply discarded (we do nothing with it).
+    // This is the single most important behavioral difference between
+    // LIMIT and MARKET orders.
+    if (incoming.quantity > 0 && !is_market) {
         addOrder(incoming);
     }
+    // If is_market && incoming.quantity > 0, the remainder is intentionally
+    // discarded here — MARKET order leftover does NOT rest in the book.
 
     return trades;
+}
+
+// ---------------------------------------------------------------------------
+// modifyOrder
+//
+// Modifies an existing resting order's price and/or quantity.
+//
+// Three cases:
+//   CASE 1: Decrease quantity only, same price → in-place update (preserves
+//           time priority).
+//   CASE 2: Price change, or quantity increase → cancel + resubmit (loses
+//           time priority, may trigger new matches).
+//   CASE 3: new_quantity == 0 → implicit full cancellation.
+//
+// Returns std::nullopt if order_id doesn't exist; otherwise returns a
+// (possibly empty) vector of Trade.
+// ---------------------------------------------------------------------------
+std::optional<std::vector<Trade>> OrderBook::modifyOrder(uint64_t order_id,
+                                                          double new_price,
+                                                          uint64_t new_quantity) {
+    // Look up the order to find its current side and price level.
+    auto idx_it = order_index_.find(order_id);
+    if (idx_it == order_index_.end()) {
+        return std::nullopt;  // order doesn't exist — clean failure
+    }
+
+    const auto side  = idx_it->second.side;
+    const auto price = idx_it->second.price;
+
+    // ------------------------------------------------------------------
+    // CASE 3: new_quantity == 0 → implicit full cancellation.
+    // Reducing quantity to zero is semantically identical to removing the
+    // order entirely.  We reuse cancelOrder() and return an empty trades
+    // vector (no matching can occur from a cancellation).
+    // ------------------------------------------------------------------
+    if (new_quantity == 0) {
+        bool cancelled = cancelOrder(order_id);
+        if (cancelled) {
+            return std::vector<Trade>{};  // successfully removed
+        }
+        return std::nullopt;  // shouldn't happen since we found it above, but safe
+    }
+
+    // Find the actual order in its deque to read its current quantity.
+    // We need this to distinguish CASE 1 (decrease-only) from CASE 2.
+    auto find_order_in_deque = [&](auto& side_map) -> Order* {
+        auto level_it = side_map.find(price);
+        if (level_it == side_map.end()) return nullptr;
+        auto& q = level_it->second;
+        for (auto& order : q) {
+            if (order.id == order_id) {
+                return &order;
+            }
+        }
+        return nullptr;
+    };
+
+    Order* order_ptr = nullptr;
+    if (side == Order::Side::BUY) {
+        order_ptr = find_order_in_deque(bids_);
+    } else {
+        order_ptr = find_order_in_deque(asks_);
+    }
+
+    if (order_ptr == nullptr) {
+        return std::nullopt;  // shouldn't happen if index is consistent
+    }
+
+    const uint64_t current_quantity = order_ptr->quantity;
+
+    // ------------------------------------------------------------------
+    // CASE 1: Decrease-only, same price.
+    // If new_price equals the current price AND new_quantity <= current
+    // quantity, update the quantity IN PLACE (mutate directly via
+    // reference).  The order does NOT change position in the deque, so
+    // time priority is preserved.  No new match can occur from a quantity
+    // decrease at an unchanged price since the order was already resting
+    // and not crossing anything.
+    // ------------------------------------------------------------------
+    if (new_price == price && new_quantity <= current_quantity) {
+        order_ptr->quantity = new_quantity;
+        return std::vector<Trade>{};  // no matches triggered
+    }
+
+    // ------------------------------------------------------------------
+    // CASE 2: Price change, OR quantity increase, OR both.
+    // This loses time priority.  Cancel the existing order (reuses
+    // cancelOrder() — do not duplicate its logic), then construct a fresh
+    // Order with the new price/quantity and a NEW timestamp, and submit it
+    // via submitOrder() (reuses matching logic — do not duplicate).
+    // ------------------------------------------------------------------
+    cancelOrder(order_id);
+
+    // Construct a fresh order with a new timestamp (Order constructor
+    // auto-assigns from the monotonic counter).  The order type is always
+    // LIMIT for resting orders being modified (MARKET orders never rest
+    // and therefore can never be modified).
+    Order new_order{order_id, side, new_price, new_quantity, Order::OrderType::LIMIT};
+
+    return submitOrder(new_order);
 }

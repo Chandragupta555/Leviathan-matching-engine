@@ -12,23 +12,31 @@
 
 struct Order {
     enum class Side : uint8_t { BUY, SELL };
+    enum class OrderType : uint8_t { LIMIT, MARKET };
 
     uint64_t    id;
     Side        side;
     double      price;
     uint64_t    quantity;   // remaining quantity to be filled
     uint64_t    timestamp;  // monotonically increasing logical clock, NOT wall time
+    OrderType   type;       // LIMIT (default) or MARKET
 
     // Construct an order and auto-assign a timestamp from a process-wide
     // monotonic counter.  Using an inline static avoids a separate .cpp
     // just for this counter; std::atomic makes it safe if we ever go
     // multi-threaded (no cost in single-threaded builds on x86).
-    Order(uint64_t id, Side side, double price, uint64_t quantity)
+    //
+    // The `type` parameter defaults to LIMIT so that all existing 4-argument
+    // call sites (e.g. Order{1, Side::BUY, 100.0, 10}) continue to compile
+    // without modification.
+    Order(uint64_t id, Side side, double price, uint64_t quantity,
+          OrderType type = OrderType::LIMIT)
         : id{id}
         , side{side}
         , price{price}
         , quantity{quantity}
         , timestamp{nextTimestamp()}
+        , type{type}
     {}
 
 private:
