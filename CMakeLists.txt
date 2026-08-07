@@ -22,3 +22,10 @@ add_executable(test_order_book
 target_link_libraries(test_order_book PRIVATE order_book)
 
 add_test(NAME OrderBookTests COMMAND test_order_book)
+
+add_executable(test_matching
+    tests/test_matching.cpp
+)
+target_link_libraries(test_matching PRIVATE order_book)
+
+add_test(NAME MatchingTests COMMAND test_matching)
