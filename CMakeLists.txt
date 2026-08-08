@@ -78,3 +78,20 @@ add_executable(test_ioc_fok
 target_link_libraries(test_ioc_fok PRIVATE order_book)
 
 add_test(NAME IocFokTests COMMAND test_ioc_fok)
+
+# --- Threading support ---
+find_package(Threads REQUIRED)
+
+# --- Matching engine library (static) ---
+add_library(matching_engine STATIC
+    src/matching_engine.cpp
+)
+target_link_libraries(matching_engine PUBLIC order_book Threads::Threads)
+
+# --- Matching engine tests ---
+add_executable(test_matching_engine
+    tests/test_matching_engine.cpp
+)
+target_link_libraries(test_matching_engine PRIVATE matching_engine)
+
+add_test(NAME MatchingEngineTests COMMAND test_matching_engine)
