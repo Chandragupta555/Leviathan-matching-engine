@@ -12,7 +12,7 @@
 
 struct Order {
     enum class Side : uint8_t { BUY, SELL };
-    enum class OrderType : uint8_t { LIMIT, MARKET };
+    enum class OrderType : uint8_t { LIMIT, MARKET, IOC, FOK };
 
     uint64_t    id;
     Side        side;

@@ -146,34 +146,100 @@ void OrderBook::removeFrontOrder_(MapType& side_map,
 }
 
 // ---------------------------------------------------------------------------
+// canFullyFillFromMap_  (file-scope helper for the FOK preview pass)
+//
+// PROVABLY READ-ONLY: This function accepts a const reference to the side map
+// and performs ZERO mutations.  It does not call removeFrontOrder_, does not
+// modify any deque, does not erase any map entry, and does not touch
+// order_index_.  It only reads iterator keys (prices) and order quantities
+// via const iteration.
+//
+// Walks the opposite side's price levels (best-first, as determined by the
+// map's comparator) and sums available quantity from orders whose price
+// satisfies the crossing check.  Returns true as soon as accumulated
+// quantity >= needed, or false if all eligible levels are exhausted.
+//
+// The `crosses` callable encodes the price-crossing rule:
+//   BUY incoming:  crosses(ask_price, buy_limit) iff ask_price <= buy_limit
+//   SELL incoming: crosses(bid_price, sell_limit) iff bid_price >= sell_limit
+// ---------------------------------------------------------------------------
+template <typename MapType, typename CrossCheck>
+static bool canFullyFillFromMap_(const MapType& side_map, double price,
+                                  uint64_t needed, CrossCheck crosses)
+{
+    uint64_t available = 0;
+    for (auto it = side_map.cbegin(); it != side_map.cend(); ++it) {
+        if (!crosses(it->first, price)) {
+            break;  // no more crossable levels (map is sorted best-first)
+        }
+        for (const auto& order : it->second) {
+            available += order.quantity;
+            if (available >= needed) {
+                return true;  // early exit — enough confirmed
+            }
+        }
+    }
+    return false;
+}
+
+bool OrderBook::canFullyFill_(Order::Side incoming_side, double price,
+                               uint64_t quantity) const
+{
+    if (incoming_side == Order::Side::BUY) {
+        // Incoming buy matches against asks; ask crosses if ask_price <= buy's limit.
+        return canFullyFillFromMap_(asks_, price, quantity,
+            [](double ask_price, double limit) { return ask_price <= limit; });
+    } else {
+        // Incoming sell matches against bids; bid crosses if bid_price >= sell's limit.
+        return canFullyFillFromMap_(bids_, price, quantity,
+            [](double bid_price, double limit) { return bid_price >= limit; });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // submitOrder
 //
 // Entry point for incoming orders.  Attempts to match against the opposite
 // side of the book, then rests any unfilled remainder via addOrder().
 //
-// Design: both LIMIT and MARKET orders share the same matching loop body.
-// The ONLY difference is the price-crossing check:
-//   - LIMIT BUY:  best ask <= incoming price   (price constraint)
-//   - LIMIT SELL: best bid >= incoming price   (price constraint)
-//   - MARKET:     always true — accepts whatever price is available
-// This avoids duplicating the fill logic for the two order types.
+// Supported order types and their behavior:
 //
-// CRITICAL: A MARKET order (OrderType::MARKET) must NEVER rest in the book.
-// If a MARKET order is not fully filled because the opposite side is
-// exhausted, the unfilled remainder is simply discarded — addOrder() is
-// NOT called for it.  This is enforced at the bottom of the function.
+//   LIMIT:  Price constraint (best opposite <= incoming price for BUY,
+//           >= for SELL).  Unfilled remainder RESTS in the book.
 //
-// Termination guarantee: the while-loop advances on every iteration because
-// each iteration either:
-//   (a) reduces incoming.quantity toward 0  (fill_qty >= 1), or
-//   (b) breaks out because no price level crosses anymore (LIMIT only),
-//       or the opposite side is empty.
-// Since incoming.quantity is finite and strictly decreases, the loop
-// terminates.
+//   MARKET: No price constraint (accepts any available price).
+//           Unfilled remainder is DISCARDED — never rests.
 //
-// Complexity: O(M * log P) where M = resting orders matched, P = price
-// levels.  Each matched order costs O(1) deque pop + O(1) hash erase +
-// amortised O(log P) map erase when a level empties.
+//   IOC:    Price constraint (same as LIMIT).
+//           Unfilled remainder is DISCARDED — never rests.
+//           Semantics: "match what you can right now, kill the rest."
+//
+//   FOK:    Price constraint (same as LIMIT).
+//           Before ANY matching, a read-only preview confirms full
+//           quantity is available at eligible prices.  If not, returns
+//           immediately with ZERO trades and ZERO mutations.
+//           If preview passes, executes normally (guaranteed full fill).
+//           Never rests under any circumstance.
+//
+// RESTRUCTURING NOTE (IOC/FOK milestone):
+// The original code used a single `is_market` boolean for two purposes:
+//   1. Skip the price-crossing check  (MARKET only)
+//   2. Prevent resting of unfilled remainder  (MARKET only)
+// These concerns are now split into two orthogonal flags:
+//   - skip_price_check: true for MARKET only (IOC/FOK have price constraints)
+//   - never_rest:       true for MARKET, IOC, and FOK (only LIMIT rests)
+//
+// For existing order types, behavior is byte-for-byte UNCHANGED:
+//   LIMIT:  skip_price_check=false, never_rest=false  (was: is_market=false)
+//   MARKET: skip_price_check=true,  never_rest=true   (was: is_market=true)
+// The matching loop body, trade construction, and fill logic are IDENTICAL.
+//
+// Termination guarantee: unchanged — the while-loop advances on every
+// iteration because fill_qty >= 1 strictly decreases incoming.quantity.
+//
+// Complexity: unchanged — O(M * log P).
+// FOK adds a preview pass of O(M_preview) where M_preview <= total eligible
+// resting orders, but this is dominated by the subsequent matching pass.
 // ---------------------------------------------------------------------------
 std::vector<Trade> OrderBook::submitOrder(Order incoming) {
     // Reject zero-quantity orders immediately.
@@ -181,20 +247,40 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
         return {};
     }
 
-    const bool is_market = (incoming.type == Order::OrderType::MARKET);
+    const auto type = incoming.type;
+
+    // Price-crossing check is skipped for MARKET orders only (they accept
+    // any available price).  LIMIT, IOC, and FOK all enforce price constraints.
+    const bool skip_price_check = (type == Order::OrderType::MARKET);
+
+    // Only LIMIT orders rest their unfilled remainder in the book.
+    // MARKET, IOC, and FOK all discard unfilled quantity.
+    const bool never_rest = (type != Order::OrderType::LIMIT);
+
+    // FOK: "fill or kill" — must confirm full quantity is available at
+    // eligible price levels BEFORE executing any matches.  If the preview
+    // finds insufficient liquidity, return immediately with zero trades
+    // and zero mutations to the book.
+    if (type == Order::OrderType::FOK) {
+        if (!canFullyFill_(incoming.side, incoming.price, incoming.quantity)) {
+            return {};
+        }
+        // Preview confirmed: enough liquidity exists.  The matching loop
+        // below is guaranteed to fully fill this order.
+    }
 
     std::vector<Trade> trades;
 
     if (incoming.side == Order::Side::BUY) {
         // Match against ASK side.
-        // LIMIT: while best ask <= incoming price.
+        // LIMIT/IOC/FOK: while best ask <= incoming price.
         // MARKET: while asks exist (no price constraint).
         while (incoming.quantity > 0 && !asks_.empty()) {
             auto level_it = asks_.begin();          // best (lowest) ask
 
             // Price-crossing check — skipped entirely for MARKET orders.
-            if (!is_market && level_it->first > incoming.price) {
-                break;  // no more crossable price levels (LIMIT only)
+            if (!skip_price_check && level_it->first > incoming.price) {
+                break;  // no more crossable price levels
             }
 
             auto& resting = level_it->second.front();  // earliest order at this level
@@ -221,14 +307,14 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
         }
     } else {
         // incoming is SELL — match against BID side.
-        // LIMIT: while best bid >= incoming price.
+        // LIMIT/IOC/FOK: while best bid >= incoming price.
         // MARKET: while bids exist (no price constraint).
         while (incoming.quantity > 0 && !bids_.empty()) {
             auto level_it = bids_.begin();          // best (highest) bid
 
             // Price-crossing check — skipped entirely for MARKET orders.
-            if (!is_market && level_it->first < incoming.price) {
-                break;  // no more crossable price levels (LIMIT only)
+            if (!skip_price_check && level_it->first < incoming.price) {
+                break;  // no more crossable price levels
             }
 
             auto& resting = level_it->second.front();
@@ -253,19 +339,16 @@ std::vector<Trade> OrderBook::submitOrder(Order incoming) {
         }
     }
 
-    // Rest any unfilled remainder via the existing addOrder() method —
-    // but ONLY for LIMIT orders.
+    // Rest any unfilled remainder — ONLY for LIMIT orders.
     //
-    // CRITICAL: MARKET orders NEVER rest.  If a MARKET order has unfilled
-    // quantity here, it means the opposite side ran out of liquidity.
-    // The remainder is simply discarded (we do nothing with it).
-    // This is the single most important behavioral difference between
-    // LIMIT and MARKET orders.
-    if (incoming.quantity > 0 && !is_market) {
+    // MARKET, IOC, and FOK orders NEVER rest:
+    //   - MARKET: opposite side exhausted, remainder discarded.
+    //   - IOC: matched what was available, remainder discarded.
+    //   - FOK: preview guaranteed full fill, so remainder is always 0 here.
+    //          (But even if it weren't, FOK would still not rest.)
+    if (incoming.quantity > 0 && !never_rest) {
         addOrder(incoming);
     }
-    // If is_market && incoming.quantity > 0, the remainder is intentionally
-    // discarded here — MARKET order leftover does NOT rest in the book.
 
     return trades;
 }

@@ -70,3 +70,11 @@ add_executable(test_replay
 target_link_libraries(test_replay PRIVATE recording_replay)
 
 add_test(NAME ReplayTests COMMAND test_replay)
+
+# --- IOC/FOK tests ---
+add_executable(test_ioc_fok
+    tests/test_ioc_fok.cpp
+)
+target_link_libraries(test_ioc_fok PRIVATE order_book)
+
+add_test(NAME IocFokTests COMMAND test_ioc_fok)

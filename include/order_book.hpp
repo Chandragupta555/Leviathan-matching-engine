@@ -126,4 +126,11 @@ private:
     // here since we always pop the front).
     template <typename MapType>
     void removeFrontOrder_(MapType& side_map, typename MapType::iterator level_it);
+
+    // Private helper for FOK (Fill-or-Kill) orders.  Performs a READ-ONLY
+    // preview of the opposite side to determine if the full incoming quantity
+    // can be filled at eligible price levels.  Returns true if sufficient
+    // liquidity exists, false otherwise.  PROVABLY READ-ONLY — see
+    // implementation comment in order_book.cpp.
+    bool canFullyFill_(Order::Side incoming_side, double price, uint64_t quantity) const;
 };
